@@ -1,0 +1,1609 @@
+#!/usr/bin/env python3
+"""
+DADDY Report Bot
+run: python3.13 app.py
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+import inspect
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+try:
+    from telethon import TelegramClient, events, functions, types, Button
+    from telethon.errors import (
+        SessionPasswordNeededError,
+        FloodWaitError,
+        PhoneCodeExpiredError,
+        PhoneCodeInvalidError,
+        UserNotParticipantError,
+        ChannelPrivateError,
+    )
+except ImportError:
+    print("[!] telethon not installed. run: pip install telethon")
+    sys.exit(1)
+
+# ─────────────────────────── CONFIG ───────────────────────────
+BOT_TOKEN = "8594487296:AAFBDQq04O0vH01ByUH7okGNTE3NoTbYZV8"
+SUPER_ADMIN_USERNAME = "deathalive07"
+SUPPORT_ID = "deathalive07"
+
+REQUIRED_CHANNELS = ["trusteddealers_07", "trusteddealers07"]
+
+MAX_ADMINS = 5
+COOLDOWN_SECONDS = 30
+REPLY_PER_ACCOUNT = True
+
+API_POOL = [
+    (33576198, "7b59cd4d6fed5c8aa9c794f204e25050", "in", "in-hanuman"),
+    (36603675, "178e45d560ea6d3d45ef83603165f25b", "in", "in-shiv"),
+    (34540299, "edf6ec574eb38bd1d60facca6ea360e2", "in", "in-krishna"),
+    (31222438, "d17172a533c51807a7fc4f91bf73a5f5", "in", "in-laxmi"),
+    (37955502, "0826f6dcedf65ea1bf90743f1a577cc4", "ru", "ru-russia07"),
+    (33312136, "528c3a422266cff9d8d7568896bdec3e", "ru", "ru-daddy07"),
+    (22015656, "23f9446294df969c87a4921a63f2c7c3", "ru", "ru-superhero07"),
+    (30787958, "d20dbf7672502bd1af9fa63080580a25", "ru", "ru-naruto07"),
+]
+
+REPORT_REASONS = {
+    "spam": {"label": "📧  SPAM / SCAM", "reason": "Spam"},
+    "violence": {"label": "⚔️  VIOLENCE", "reason": "Violence"},
+    "drugs": {"label": "💊  DRUGS", "reason": "IllegalDrugs"},
+    "personal": {"label": "🪪  DOXXING", "reason": "PersonalDetails"},
+    "copyright": {"label": "©️  COPYRIGHT", "reason": "Copyright"},
+    "porn": {"label": "🔞  PORNOGRAPHY", "reason": "Pornography"},
+    "child": {"label": "🚨  CHILD SAFETY", "reason": "ChildAbuse"},
+    "fake": {"label": "🎭  FAKE / IMPERSONATION", "reason": "Fake"},
+    "other": {"label": "📌  OTHER", "reason": "Other"},
+}
+
+DEFAULT_REASON = "spam"
+
+BASE = Path(__file__).parent
+SESSION_DIR = BASE / "sessions"
+SESSION_DIR.mkdir(exist_ok=True)
+ACCOUNTS_FILE = BASE / "accounts.txt"
+STATS_FILE = BASE / "stats.json"
+SESSION_API_FILE = BASE / "session_api.json"
+ADMINS_FILE = BASE / "admins.json"
+USERS_FILE = BASE / "users.json"
+SUPPORT_FILE = BASE / "support.json"
+BOT_SESSION = str(BASE / "bot_session")
+
+TARGET_RE = re.compile(r"^@([a-zA-Z0-9_]{5,32})$")
+NUMERIC_ID_RE = re.compile(r"^(\d{5,15})$")
+
+PHONE_REGION = {
+    "+7": "ru", "+91": "in", "+44": "uk", "+261": "mg",
+    "+1": "us", "+234": "ng", "+92": "pk", "+880": "bd",
+    "+62": "id", "+60": "my", "+63": "ph", "+84": "vn",
+    "+20": "eg", "+212": "ma", "+27": "za", "+55": "br",
+    "+52": "mx", "+49": "de", "+33": "fr", "+39": "it",
+    "+34": "es", "+81": "jp", "+82": "kr", "+86": "cn",
+    "+90": "tr", "+98": "ir", "+964": "iq", "+963": "sy",
+}
+
+
+def parse_target(text: str):
+    m = TARGET_RE.match(text)
+    if m:
+        return ("username", m.group(1))
+    m = NUMERIC_ID_RE.match(text)
+    if m:
+        return ("id", m.group(1))
+    return (None, None)
+
+
+def _validate_pool():
+    if not API_POOL:
+        raise ValueError("API_POOL is empty")
+    seen = set()
+    for entry in API_POOL:
+        if len(entry) != 4:
+            raise ValueError(f"pool entry must be (id, hash, region, label): {entry!r}")
+        api_id, api_hash, region, label = entry
+        if not isinstance(api_id, int):
+            raise ValueError(f"api_id must be int: {api_id!r}")
+        if api_id in seen:
+            raise ValueError(f"duplicate api_id: {api_id}")
+        seen.add(api_id)
+        if not isinstance(api_hash, str) or len(api_hash) != 32:
+            raise ValueError(f"api_hash for {api_id} bad length: {api_hash!r}")
+        if not all(c in "0123456789abcdef" for c in api_hash.lower()):
+            raise ValueError(f"api_hash for {api_id} non-hex: {api_hash!r}")
+        if not isinstance(region, str) or not region:
+            raise ValueError(f"region missing for {api_id}")
+        if not isinstance(label, str) or not label:
+            raise ValueError(f"label missing for {api_id}")
+
+
+_validate_pool()
+print(f"[*] api pool validated: {len(API_POOL)} pair(s)")
+
+try:
+    print("[*] ReportRequest signature:",
+          inspect.signature(functions.messages.ReportRequest.__init__))
+except Exception as _e:
+    print("[!] could not inspect ReportRequest:", _e)
+
+
+def get_reason_obj(reason_key: str):
+    spec = REPORT_REASONS.get(reason_key) or REPORT_REASONS[DEFAULT_REASON]
+    suffix = spec["reason"]
+    for c in (f"InputReportReason{suffix}", f"ReportReason{suffix}"):
+        cls = getattr(types, c, None)
+        if cls is not None:
+            try:
+                return cls()
+            except Exception:
+                continue
+    try:
+        from telethon.tl.types import InputReportReasonSpam
+        return InputReportReasonSpam()
+    except Exception:
+        return None
+
+
+def call_report_request(peer, reason_obj):
+    """build ReportRequest matching the installed telethon signature."""
+    RR = functions.messages.ReportRequest
+    # newer telethon signature: (peer, id, option, message)
+    try:
+        return RR(peer=peer, id=[], option=reason_obj, message="")
+    except TypeError:
+        pass
+    # positional version of the same
+    try:
+        return RR(peer, [], reason_obj, "")
+    except TypeError:
+        pass
+    # older 3-arg form
+    try:
+        return RR(peer, reason_obj, "")
+    except TypeError:
+        pass
+    # oldest 2-arg form
+    return RR(peer, reason_obj)
+
+
+# ─────────────────── ADMINS ───────────────────────────────────
+def load_admins():
+    if ADMINS_FILE.exists():
+        try:
+            return json.loads(ADMINS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_admins(data):
+    ADMINS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def is_super(user_id: int) -> bool:
+    entry = load_admins().get(str(user_id))
+    return bool(entry and entry.get("super"))
+
+
+def is_admin(user_id: int) -> bool:
+    return str(user_id) in load_admins()
+
+
+def count_admins() -> int:
+    admins = load_admins()
+    return sum(1 for u, e in admins.items() if not e.get("super"))
+
+
+def add_admin(user_id: int, username: str):
+    admins = load_admins()
+    admins[str(user_id)] = {"username": username, "super": False}
+    save_admins(admins)
+
+
+def remove_admin(user_id: int):
+    admins = load_admins()
+    admins.pop(str(user_id), None)
+    save_admins(admins)
+
+
+# ─────────────────── USERS + PREMIUM ──────────────────────────
+def load_users():
+    if USERS_FILE.exists():
+        try:
+            return json.loads(USERS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_users(data):
+    USERS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def get_user_entry(user_id: int):
+    return load_users().get(str(user_id))
+
+
+def is_user(user_id: int) -> bool:
+    return str(user_id) in load_users()
+
+
+def is_user_premium(user_id: int) -> bool:
+    e = get_user_entry(user_id)
+    if not e or not e.get("premium"):
+        return False
+    exp = e.get("premium_until")
+    if exp is None:
+        return True
+    try:
+        return datetime.now(timezone.utc) < datetime.fromisoformat(exp)
+    except Exception:
+        return False
+
+
+def is_user_granted_premium(user_id: int) -> bool:
+    e = get_user_entry(user_id)
+    return bool(e and e.get("premium"))
+
+
+def user_premium_expiry_str(user_id: int) -> str:
+    e = get_user_entry(user_id) or {}
+    exp = e.get("premium_until")
+    if not exp:
+        return "no premium"
+    try:
+        dt = datetime.fromisoformat(exp)
+        remaining = dt - datetime.now(timezone.utc)
+        if remaining.total_seconds() <= 0:
+            return "0d 0h"
+        return f"{remaining.days}d {remaining.seconds//3600}h"
+    except Exception:
+        return "unknown"
+
+
+def grant_user_premium(user_id: int, username: str, days: int):
+    users = load_users()
+    exp = datetime.now(timezone.utc) + timedelta(days=days)
+    users[str(user_id)] = {
+        "username": username,
+        "premium": True,
+        "premium_until": exp.isoformat(),
+    }
+    save_users(users)
+
+
+def revoke_user_premium(user_id: int) -> bool:
+    users = load_users()
+    if str(user_id) in users:
+        users[str(user_id)]["premium"] = False
+        users[str(user_id)]["premium_until"] = None
+        save_users(users)
+        return True
+    return False
+
+
+def count_user_premiums() -> int:
+    return sum(1 for e in load_users().values() if e.get("premium"))
+
+
+def ensure_user_registered(uid: int, uname: str = None):
+    users = load_users()
+    if str(uid) not in users:
+        users[str(uid)] = {
+            "username": uname or f"user{uid}",
+            "premium": False,
+            "premium_until": None,
+        }
+        save_users(users)
+        return True
+    return False
+
+
+# ─────────────────── REGION / PAIR ───────────────────────────
+def region_of_phone(phone: str) -> str:
+    if not phone:
+        return "unknown"
+    matches = [p for p in PHONE_REGION if phone.startswith(p)]
+    if not matches:
+        return "unknown"
+    return PHONE_REGION[max(matches, key=len)]
+
+
+def ordered_pairs_for(phone: str, preferred: int = None):
+    want = region_of_phone(phone)
+    pref = [p for p in API_POOL if p[0] == preferred]
+    region = [p for p in API_POOL if p[2] == want and p[0] != preferred]
+    rest = [p for p in API_POOL if p not in pref and p not in region]
+    return pref + region + rest
+
+
+# ─────────────────── HELPERS ──────────────────────────────────
+def list_sessions():
+    return sorted([f for f in os.listdir(SESSION_DIR) if f.endswith(".session")])
+
+
+def load_stats():
+    if STATS_FILE.exists():
+        try:
+            return json.loads(STATS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_stats(stats):
+    STATS_FILE.write_text(json.dumps(stats, indent=2))
+
+
+def load_session_api():
+    if SESSION_API_FILE.exists():
+        try:
+            return json.loads(SESSION_API_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_session_api(session_name: str, api_id: int, api_hash: str, region: str, label: str, owner_id: int = None):
+    data = load_session_api()
+    prev = data.get(session_name, {})
+    data[session_name] = {
+        "api_id": api_id, "api_hash": api_hash, "region": region, "label": label,
+        "owner_id": owner_id if owner_id is not None else prev.get("owner_id"),
+    }
+    SESSION_API_FILE.write_text(json.dumps(data, indent=2))
+
+
+def get_session_api(session_name: str):
+    entry = load_session_api().get(session_name)
+    if not entry:
+        return None
+    return entry["api_id"], entry["api_hash"]
+
+
+def session_owner(session_name: str):
+    entry = load_session_api().get(session_name)
+    if not entry:
+        return None
+    return entry.get("owner_id")
+
+
+def append_account(phone: str):
+    if not ACCOUNTS_FILE.exists():
+        ACCOUNTS_FILE.write_text("")
+    existing = [l.strip() for l in ACCOUNTS_FILE.read_text().splitlines() if l.strip()]
+    if phone in existing:
+        return False
+    with ACCOUNTS_FILE.open("a") as f:
+        f.write(phone + "\n")
+    return True
+
+
+def remove_account(phone: str):
+    sess = SESSION_DIR / (phone.replace("+", "") + ".session")
+    removed = False
+    if sess.exists():
+        sess.unlink(); removed = True
+    if ACCOUNTS_FILE.exists():
+        lines = [l for l in ACCOUNTS_FILE.read_text().splitlines() if l.strip() != phone]
+        ACCOUNTS_FILE.write_text("\n".join(lines) + ("\n" if lines else ""))
+    data = load_session_api()
+    data.pop(phone.replace("+", "") + ".session", None)
+    SESSION_API_FILE.write_text(json.dumps(data, indent=2))
+    return removed
+
+
+# ─────────────────── CONNECT ──────────────────────────────────
+_code_futures = {}
+_connect_lock = asyncio.Lock()
+
+
+async def connect_one(phone: str, preferred_api: int = None, owner_id: int = None, max_resends: int = 5) -> dict:
+    session_path = str(SESSION_DIR / phone.replace("+", ""))
+    session_name = os.path.basename(session_path) + ".session"
+    session_file = Path(session_path + ".session")
+
+    ordered = ordered_pairs_for(phone, preferred=preferred_api)
+    print(f"\n[*] connecting {phone} — {len(ordered)} pair(s) available")
+
+    for attempt, (api_id, api_hash, region, label) in enumerate(ordered, 1):
+        if session_file.exists():
+            try: session_file.unlink()
+            except Exception: pass
+
+        print(f"[*] attempt {attempt}/{len(ordered)} — {label} (api_id={api_id})")
+        client = TelegramClient(session_path, api_id, api_hash)
+
+        try:
+            await client.connect()
+            print(f"[*] {label}: connected to telegram")
+
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                print(f"[+] {phone} already linked as {me.username or me.id}")
+                await client.disconnect()
+                save_session_api(session_name, api_id, api_hash, region, label, owner_id=owner_id)
+                return {"ok": True, "message": f"already linked via {label}"}
+
+            print(f"[*] {label}: requesting code from telegram...")
+            try:
+                sent = await client.send_code_request(phone)
+                print(f"[+] {label}: code REQUESTED")
+                print(f"[+] {label}: delivery = {sent.type.__class__.__name__}")
+            except FloodWaitError as e:
+                print(f"[x] {label}: FLOOD_WAIT {e.seconds}s. next pair...")
+                try: await client.disconnect()
+                except Exception: pass
+                continue
+
+            resend_count = 0
+            signed_in = False
+
+            while not signed_in:
+                print(f"[*] {label}: WAITING FOR CODE IN CHAT...")
+                code = await wait_for_code(phone)
+                if code is None:
+                    print(f"[x] {label}: timeout. next pair...")
+                    break
+
+                code = code.strip().replace(" ", "")
+                print(f"[*] {label}: code from chat: '{code}'")
+
+                if code.lower() in ("resend", "again", "r"):
+                    if resend_count >= max_resends:
+                        print(f"[x] {label}: resend limit. next pair...")
+                        break
+                    resend_count += 1
+                    try:
+                        sent = await client.send_code_request(phone)
+                        print(f"[+] {label}: fresh code ({resend_count}/{max_resends})")
+                        continue
+                    except FloodWaitError as e:
+                        print(f"[x] flood {e.seconds}s. next pair...")
+                        break
+
+                try:
+                    await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
+                    signed_in = True
+                    print(f"[+] {label}: SIGN IN OK")
+                except SessionPasswordNeededError:
+                    print(f"[*] {label}: 2FA needed")
+                    pw = await wait_for_code(phone)
+                    if pw is None:
+                        break
+                    await client.sign_in(password=pw.strip())
+                    signed_in = True
+                    print(f"[+] {label}: 2FA OK")
+                except (PhoneCodeExpiredError, PhoneCodeInvalidError) as e:
+                    print(f"[x] {label}: {type(e).__name__}")
+                    if resend_count >= max_resends:
+                        break
+                    resend_count += 1
+                    try:
+                        sent = await client.send_code_request(phone)
+                        print(f"[+] {label}: fresh code ({resend_count}/{max_resends})")
+                    except FloodWaitError as e2:
+                        print(f"[x] flood {e2.seconds}s. next pair...")
+                        break
+
+            if signed_in:
+                me = await client.get_me()
+                print(f"[+] {phone} LINKED as {me.username or me.id} via {label}")
+                await client.disconnect()
+                save_session_api(session_name, api_id, api_hash, region, label, owner_id=owner_id)
+                return {"ok": True, "message": f"linked via {label}"}
+
+            try: await client.disconnect()
+            except Exception: pass
+            continue
+
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            print(f"[x] {label} failed: {err}")
+            try: await client.disconnect()
+            except Exception: pass
+            low = err.lower()
+            if any(k in low for k in ("api_id", "api_hash", "phone", "expired", "invalid", "flood", "auth")):
+                continue
+            return {"ok": False, "message": err}
+
+    return {"ok": False, "message": f"failed on all {len(ordered)} pair(s)"}
+
+
+async def wait_for_code(phone: str, timeout: int = 600) -> str:
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _code_futures[phone] = fut
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        _code_futures.pop(phone, None)
+        return None
+
+
+def deliver_code(phone: str, code: str) -> bool:
+    fut = _code_futures.get(phone)
+    if fut and not fut.done():
+        fut.set_result(code)
+        _code_futures.pop(phone, None)
+        return True
+    return False
+
+
+# ─────────────────── REPORTER ─────────────────────────────────
+async def report_from_session(session_path, target_username, reason_obj):
+    session_name = os.path.basename(session_path)
+    bound = get_session_api(session_name)
+    if bound:
+        api_id, api_hash = bound
+    else:
+        api_id, api_hash, _, _ = API_POOL[abs(hash(session_name)) % len(API_POOL)]
+
+    client = TelegramClient(session_path, api_id, api_hash)
+    result = {"session": session_name, "ok": False, "error": None}
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            result["error"] = "not_authorized"
+            return result
+        try:
+            target = await client.get_entity(target_username)
+        except Exception as e:
+            result["error"] = f"resolve_fail: {str(e)[:120]}"
+            return result
+        peer = await client.get_input_entity(target)
+        req = call_report_request(peer, reason_obj)
+        await client(req)
+        result["ok"] = True
+    except FloodWaitError as e:
+        result["error"] = f"flood_wait: {e.seconds}s"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    finally:
+        try: await client.disconnect()
+        except Exception: pass
+    return result
+
+
+async def run_report(target_username, reason_key: str = None, progress_cb=None, viewer_uid: int = None):
+    reason_key = reason_key or DEFAULT_REASON
+    sessions = list_sessions()
+    if not sessions:
+        return {"error": "no_sessions_linked", "total": 0, "ok": 0, "fail": 0, "results": []}
+    reason_obj = get_reason_obj(reason_key)
+    if reason_obj is None:
+        return {"error": "could_not_resolve_report_reason", "total": 0, "ok": 0, "fail": 0, "results": []}
+    results, ok_count = [], 0
+
+    for i, sess in enumerate(sessions, 1):
+        path = str(SESSION_DIR / sess)
+        try:
+            r = await report_from_session(path, target_username, reason_obj)
+        except Exception as e:
+            r = {"session": sess, "ok": False, "error": f"crash: {str(e)[:120]}"}
+        results.append(r)
+        if r["ok"]: ok_count += 1
+        if progress_cb:
+            try: await progress_cb(i, len(sessions), sess, r["ok"], viewer_uid)
+            except Exception: pass
+        await asyncio.sleep(COOLDOWN_SECONDS)
+
+    summary = {"target": str(target_username), "reason": reason_key, "total": len(sessions),
+               "ok": ok_count, "fail": len(sessions) - ok_count, "results": results}
+    stats = load_stats()
+    key = str(target_username)
+    stats.setdefault(key, {"ok": 0, "fail": 0, "runs": 0})
+    stats[key]["ok"] += ok_count
+    stats[key]["fail"] += summary["fail"]
+    stats[key]["runs"] += 1
+    save_stats(stats)
+    return summary
+
+
+# ─────────────────── FORCE-JOIN ───────────────────────────────
+async def is_joined_required(uid: int) -> bool:
+    try:
+        for ch in REQUIRED_CHANNELS:
+            try:
+                await bot.get_permissions(ch, uid)
+            except UserNotParticipantError:
+                return False
+            except (ChannelPrivateError, ValueError):
+                return False
+            except Exception:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def join_gate_buttons():
+    rows = []
+    for ch in REQUIRED_CHANNELS:
+        rows.append([Button.url(f"📢 JOIN @{ch}", f"https://t.me/{ch}")])
+    rows.append([Button.inline("✅ I JOINED — retry", data=b"gate:check")])
+    return rows
+
+
+GATE_TEXT = (
+    "**⚠️ JOIN REQUIRED**\n\n"
+    "you must be a member of **both** channels:\n"
+    f"• @{REQUIRED_CHANNELS[0]}\n"
+    f"• @{REQUIRED_CHANNELS[1]}\n\n"
+    "tap below to join, then ✅ I JOINED."
+)
+
+
+# ─────────────────── SUPPORT ──────────────────────────────────
+def load_support():
+    if SUPPORT_FILE.exists():
+        try:
+            return json.loads(SUPPORT_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_support(data):
+    SUPPORT_FILE.write_text(json.dumps(data, indent=2))
+
+
+# ─────────────────── BUTTONS ──────────────────────────────────
+def main_menu_buttons(uid):
+    if is_super(uid):
+        return [
+            [Button.inline("🔗  LINK ACCOUNT", data=b"menu:connect"),
+             Button.inline("➕  ADD ACCOUNT", data=b"menu:add")],
+            [Button.inline("📋  MY ACCOUNTS", data=b"menu:list"),
+             Button.inline("🗑  REMOVE ACCOUNT", data=b"menu:remove")],
+            [Button.inline("🎯  REPORT USER / ID", data=b"menu:report"),
+             Button.inline("📣  REPORT CHANNEL", data=b"menu:report_channel")],
+            [Button.inline("🆔  CAPTURE USER ID", data=b"menu:capture_id"),
+             Button.inline("📊  STATS", data=b"menu:status")],
+            [Button.inline("💬  HELP", data=b"menu:support"),
+             Button.inline("👤  ADMIN PANEL", data=b"menu:admins")],
+            [Button.inline("➕  ADD ADMIN", data=b"menu:add_admin"),
+             Button.inline("❌  REMOVE ADMIN", data=b"menu:remove_admin")],
+            [Button.inline("💎  GRANT PREMIUM", data=b"menu:grant_premium"),
+             Button.inline("⬇️  REVOKE PREMIUM", data=b"menu:revoke_premium")],
+            [Button.inline("👥  PREMIUM LIST", data=b"menu:premium_list"),
+             Button.inline("🔑  API POOL", data=b"menu:pool")],
+            [Button.inline("📬  SUPPORT INBOX", data=b"menu:support_inbox")],
+            [Button.inline("✖  CLOSE", data=b"menu:close")],
+        ]
+
+    if is_admin(uid):
+        return [
+            [Button.inline("🔗  LINK ACCOUNT", data=b"menu:connect"),
+             Button.inline("➕  ADD ACCOUNT", data=b"menu:add")],
+            [Button.inline("🎯  REPORT USER / ID", data=b"menu:report"),
+             Button.inline("📣  REPORT CHANNEL", data=b"menu:report_channel")],
+            [Button.inline("🆔  CAPTURE USER ID", data=b"menu:capture_id")],
+            [Button.inline("💎  GRANT PREMIUM", data=b"menu:grant_premium"),
+             Button.inline("👥  PREMIUM LIST", data=b"menu:premium_list")],
+            [Button.inline("💬  HELP", data=b"menu:support")],
+            [Button.inline("✖  CLOSE", data=b"menu:close")],
+        ]
+
+    return [
+        [Button.inline("🎯  REPORT USER / ID", data=b"menu:report"),
+         Button.inline("📣  REPORT CHANNEL", data=b"menu:report_channel")],
+        [Button.inline("💬  HELP", data=b"menu:support"),
+         Button.inline("📞  CONTACT ADMIN", data=b"menu:contact_admin")],
+        [Button.inline("✖  CLOSE", data=b"menu:close")],
+    ]
+
+
+def pair_buttons():
+    rows = []
+    for api_id, _, region, label in API_POOL:
+        rows.append([
+            Button.inline(f"🔑  {label}  ·  {region}  ·  {api_id}",
+                          data=f"pair:{api_id}".encode())
+        ])
+    rows.append([Button.inline("◀  BACK", data=b"menu:connect")])
+    return rows
+
+
+def reason_buttons():
+    rows, row = [], []
+    for key, spec in REPORT_REASONS.items():
+        row.append(Button.inline(spec["label"], data=f"reason:{key}".encode()))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([Button.inline("◀  BACK", data=b"menu:main")])
+    return rows
+
+
+def phone_buttons():
+    phones = []
+    if ACCOUNTS_FILE.exists():
+        phones = [l.strip() for l in ACCOUNTS_FILE.read_text().splitlines() if l.strip()]
+    pending = [p for p in phones if not (SESSION_DIR / (p.replace("+", "") + ".session")).exists()]
+    rows = [[Button.inline(f"📱  {p}", data=f"phone:{p}".encode())] for p in pending[:20]]
+    rows.append([Button.inline("◀  BACK", data=b"menu:main")])
+    return rows, len(pending)
+
+
+def linked_accounts_buttons(uid):
+    sessions = list_sessions()
+    bound = load_session_api()
+    is_sup = is_super(uid)
+    rows = []
+    for s in sessions:
+        info = bound.get(s, {})
+        if not is_sup:
+            continue
+        display = s[:-8]
+        label = f"📱  {display}  ·  {info.get('label','?')}"
+        rows.append([Button.inline(label, data=f"acct:{s[:-8]}".encode())])
+    if not rows:
+        rows.append([Button.inline("(no accounts)", data=b"noop")])
+    rows.append([Button.inline("◀  BACK", data=b"menu:main")])
+    return rows
+
+
+def account_detail_buttons(phone, uid):
+    rows = []
+    if is_super(uid):
+        rows.append([Button.inline("🗑  UNLINK THIS ACCOUNT", data=f"unlink:{phone}".encode())])
+    rows.append([Button.inline("◀  BACK", data=b"menu:list")])
+    return rows
+
+
+def admin_list_buttons():
+    admins = load_admins()
+    rows = []
+    for uid_str, info in admins.items():
+        if info.get("super"):
+            continue
+        label = f"👤  @{info.get('username','?')}"
+        rows.append([Button.inline(label, data=f"adm:{uid_str}".encode())])
+    if not rows:
+        rows.append([Button.inline("(no admins)", data=b"noop")])
+    rows.append([Button.inline("◀  BACK", data=b"menu:main")])
+    return rows
+
+
+def admin_detail_buttons(uid_str):
+    rows = [[Button.inline("❌  REMOVE THIS ADMIN", data=f"revoke:{uid_str}".encode())]]
+    rows.append([Button.inline("◀  BACK", data=b"menu:admins")])
+    return rows
+
+
+def premium_list_buttons():
+    users = load_users()
+    rows = []
+    for uid_str, info in users.items():
+        if not info.get("premium"):
+            continue
+        exp = user_premium_expiry_str(int(uid_str))
+        label = f"💎  @{info.get('username','?')} · {exp}"
+        rows.append([Button.inline(label, data=f"puser:{uid_str}".encode())])
+    if not rows:
+        rows.append([Button.inline("(no premium users)", data=b"noop")])
+    rows.append([Button.inline("◀  BACK", data=b"menu:main")])
+    return rows
+
+
+def support_inbox_buttons():
+    inbox = load_support()
+    rows = []
+    for msg_id, entry in list(inbox.items())[-20:]:
+        label = f"📩  @{entry.get('from_username','?')} · {entry.get('preview','')[:20]}"
+        rows.append([Button.inline(label, data=f"smsg:{msg_id}".encode())])
+    if not rows:
+        rows.append([Button.inline("(no messages)", data=b"noop")])
+    rows.append([Button.inline("◀  BACK", data=b"menu:main")])
+    return rows
+
+
+# ─────────────────── BOT ──────────────────────────────────────
+BOT_API_ID, BOT_API_HASH, _, _ = API_POOL[0]
+bot = TelegramClient(BOT_SESSION, BOT_API_ID, BOT_API_HASH)
+SUPER_ID = None
+
+_ui = {}
+_active_connect = {}
+
+
+def MAIN_TEXT(uid):
+    if is_super(uid):
+        return "**NIK bot — OWNER**\n\nTap any function below."
+    if is_admin(uid):
+        return "**NIK bot — ADMIN**\n\nlink · add · report · grant premium"
+    if is_user_granted_premium(uid):
+        exp = user_premium_expiry_str(uid)
+        active = is_user_premium(uid)
+        if active:
+            return (f"**NIK bot — PREMIUM ✅**\n\n"
+                    f"**premium left: {exp}**\n\n"
+                    "tap a function below.")
+        return (f"**NIK bot — PREMIUM ⏰ EXPIRED**\n\n"
+                f"**premium left: {exp}**\n\n"
+                "your premium has ended.\ncontact admin to renew.")
+    return (f"**NIK bot — USER**\n\n"
+            f"**premium left: {user_premium_expiry_str(uid)}**\n\n"
+            "tap a function below.")
+
+
+async def gate_ok(event) -> bool:
+    uid = event.sender_id
+    if is_super(uid):
+        return True
+    try:
+        joined = await is_joined_required(uid)
+    except Exception:
+        joined = False
+    if joined:
+        return True
+    try:
+        sender = await event.get_sender()
+        uname = getattr(sender, "username", None)
+    except Exception:
+        uname = None
+    if not is_admin(uid):
+        ensure_user_registered(uid, uname)
+    try:
+        await event.respond(GATE_TEXT, buttons=join_gate_buttons())
+    except Exception:
+        pass
+    return False
+
+
+@bot.on(events.NewMessage(pattern=r"^/start"))
+async def cmd_start(e):
+    uid = e.sender_id
+    try:
+        sender = await e.get_sender()
+        uname = getattr(sender, "username", None)
+    except Exception:
+        uname = None
+    if not is_admin(uid):
+        ensure_user_registered(uid, uname)
+    if not await gate_ok(e):
+        return
+    await e.reply(MAIN_TEXT(uid), buttons=main_menu_buttons(uid))
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^gate:check$"))
+async def cb_gate_check(event):
+    uid = event.sender_id
+    try:
+        sender = await event.get_sender()
+        uname = getattr(sender, "username", None)
+    except Exception:
+        uname = None
+    if not is_admin(uid):
+        ensure_user_registered(uid, uname)
+    if await is_joined_required(uid):
+        await event.edit(MAIN_TEXT(uid), buttons=main_menu_buttons(uid))
+    else:
+        await event.answer("still not in both channels", alert=True)
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^menu:"))
+async def cb_menu(event):
+    uid = event.sender_id
+    if not (is_super(uid) or is_admin(uid) or is_user(uid)):
+        await event.answer("no access"); return
+    if not await gate_ok(event):
+        return
+    action = event.data.decode().split(":", 1)[1]
+
+    if action == "main":
+        await event.edit(MAIN_TEXT(uid), buttons=main_menu_buttons(uid)); return
+    if action == "close":
+        await event.delete(); return
+
+    if action == "support":
+        await event.edit(
+            f"**💬 HELP**\n\n"
+            f"admin telegram id:\n"
+            f"👉 `@{SUPPORT_ID}`\n\n"
+            f"to contact privately, tap **📞 CONTACT ADMIN**.",
+            buttons=[
+                [Button.inline("📞  CONTACT ADMIN", data=b"menu:contact_admin")],
+                [Button.inline("◀  BACK", data=b"menu:main")],
+            ],
+        )
+        return
+
+    if action == "contact_admin":
+        _ui[uid] = {"stage": "await_support_msg"}
+        await event.edit(
+            "**📞 CONTACT ADMIN**\n\n"
+            "type your message here.\n"
+            "it will be delivered privately to the owner.",
+            buttons=[[Button.inline("❌  CANCEL", data=b"menu:main")]],
+        )
+        return
+
+    if action == "capture_id":
+        if not (is_super(uid) or is_admin(uid)):
+            await event.answer("no access"); return
+        _ui[uid] = {"stage": "await_capture_forward"}
+        await event.edit(
+            "**🆔 CAPTURE USER ID**\n\n"
+            "forward any message from the user\n"
+            "OR send their @username\n"
+            "OR send their numeric id\n\n"
+            "the bot will reply with their numeric telegram id.",
+            buttons=[[Button.inline("❌  CANCEL", data=b"menu:main")]],
+        )
+        return
+
+    if action in ("report", "report_channel"):
+        allowed = is_super(uid) or is_admin(uid)
+        if not allowed:
+            if is_user_granted_premium(uid):
+                allowed = is_user_premium(uid)
+            else:
+                allowed = False
+        if not allowed:
+            if is_user_granted_premium(uid) and not is_user_premium(uid):
+                await event.answer("⏰ premium expired — contact admin", alert=True)
+            else:
+                await event.answer("no premium — contact admin", alert=True)
+            return
+        _ui[uid] = {"stage": "await_target", "mode": action}
+        if action == "report":
+            await event.edit(
+                "**🎯 REPORT USERNAME / ID**\n\n"
+                "reply with the target:\n"
+                "• username — e.g. `@scammer123`\n"
+                "• numeric id — e.g. `1234567890`",
+                buttons=[[Button.inline("❌  CANCEL", data=b"menu:main")]],
+            )
+        else:
+            await event.edit(
+                "**📣 REPORT CHANNEL**\n\n"
+                "reply with the channel:\n"
+                "• username — e.g. `@spamchannel`\n"
+                "• numeric id — e.g. `1234567890`",
+                buttons=[[Button.inline("❌  CANCEL", data=b"menu:main")]],
+            )
+        return
+
+    if action in ("add", "connect"):
+        if not (is_super(uid) or is_admin(uid)):
+            await event.answer("no access"); return
+        if action == "add":
+            _ui[uid] = {"stage": "await_phone"}
+            await event.edit(
+                "**ADD ACCOUNT**\n\n"
+                "reply with the phone in `+` format.\n"
+                "example: `+919999999999`",
+                buttons=[[Button.inline("◀  BACK", data=b"menu:main")]],
+            )
+            return
+        rows, count = phone_buttons()
+        if count == 0:
+            await event.edit(
+                "**no pending accounts.**\n\nfirst ➕ ADD ACCOUNT.",
+                buttons=[
+                    [Button.inline("➕  ADD ACCOUNT", data=b"menu:add")],
+                    [Button.inline("◀  BACK", data=b"menu:main")],
+                ],
+            )
+            return
+        await event.edit("**LINK ACCOUNT — pick phone:**", buttons=rows)
+        return
+
+    if action == "list":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        if not list_sessions():
+            await event.edit("no accounts linked yet.",
+                             buttons=[[Button.inline("◀  BACK", data=b"menu:main")]])
+            return
+        await event.edit(f"**{len(list_sessions())} linked accounts** (owner view):",
+                         buttons=linked_accounts_buttons(uid))
+        return
+
+    if action == "remove":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        if not list_sessions():
+            await event.edit("no accounts to remove.",
+                             buttons=[[Button.inline("◀  BACK", data=b"menu:main")]])
+            return
+        await event.edit("**REMOVE ACCOUNT — pick:**",
+                         buttons=linked_accounts_buttons(uid))
+        return
+
+    if action == "admins":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        await event.edit("**ADMIN PANEL** — tap:", buttons=admin_list_buttons())
+        return
+
+    if action == "add_admin":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        if count_admins() >= MAX_ADMINS:
+            await event.answer(f"admin slots full ({MAX_ADMINS}/{MAX_ADMINS})", alert=True)
+            return
+        _ui[uid] = {"stage": "await_add_admin"}
+        await event.edit(
+            "**ADD ADMIN**\n\n"
+            "reply with the username (`@name`) **OR** numeric id.",
+            buttons=[[Button.inline("◀  BACK", data=b"menu:main")]],
+        )
+        return
+
+    if action == "remove_admin":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        await event.edit("**REMOVE ADMIN** — tap:", buttons=admin_list_buttons())
+        return
+
+    if action == "grant_premium":
+        if not (is_super(uid) or is_admin(uid)):
+            await event.answer("no access"); return
+        _ui[uid] = {"stage": "await_grant_premium"}
+        await event.edit(
+            "**GRANT PREMIUM**\n\n"
+            "reply with the target **AND** number of days.\n\n"
+            "examples:\n"
+            "• `@user 30` — username, 30 days\n"
+            "• `1234567890 30` — numeric id, 30 days",
+            buttons=[[Button.inline("◀  BACK", data=b"menu:main")]],
+        )
+        return
+
+    if action == "premium_list":
+        if not (is_super(uid) or is_admin(uid)):
+            await event.answer("no access"); return
+        await event.edit("**PREMIUM USERS** — tap:", buttons=premium_list_buttons())
+        return
+
+    if action == "revoke_premium":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        await event.edit("**REVOKE PREMIUM** — tap:", buttons=premium_list_buttons())
+        return
+
+    if action == "status":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        stats = load_stats()
+        if not stats:
+            await event.edit("no reports yet.",
+                             buttons=[[Button.inline("◀  BACK", data=b"menu:main")]])
+            return
+        lines = [f"`{t}` — ✅ {s['ok']} / ❌ {s['fail']} / {s['runs']} runs"
+                 for t, s in stats.items()]
+        await event.edit("**LIFETIME STATS**\n\n" + "\n".join(lines),
+                         buttons=[[Button.inline("◀  BACK", data=b"menu:main")]])
+        return
+
+    if action == "pool":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        lines = [f"• **{label}** — region `{region}` — api_id `{api_id}`"
+                 for api_id, _, region, label in API_POOL]
+        await event.edit("**API POOL**\n\n" + "\n".join(lines),
+                         buttons=[[Button.inline("◀  BACK", data=b"menu:main")]])
+        return
+
+    if action == "support_inbox":
+        if not is_super(uid):
+            await event.answer("owner only"); return
+        await event.edit("**📬 SUPPORT INBOX** — tap:",
+                         buttons=support_inbox_buttons())
+        return
+
+    await event.answer("unknown")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^phone:"))
+async def cb_phone(event):
+    uid = event.sender_id
+    if not (is_super(uid) or is_admin(uid)):
+        await event.answer("no access"); return
+    phone = event.data.decode().split(":", 1)[1]
+    _ui[uid] = {"stage": "pick_pair", "phone": phone}
+    await event.edit(
+        f"**LINK ACCOUNT**\n\n"
+        f"phone: `{phone}`\n\n"
+        f"**pick api pair:**",
+        buttons=pair_buttons(),
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pair:"))
+async def cb_pair(event):
+    uid = event.sender_id
+    if not (is_super(uid) or is_admin(uid)):
+        await event.answer("no access"); return
+    api_id = int(event.data.decode().split(":", 1)[1])
+    phone = (_ui.get(uid) or {}).get("phone")
+    if not phone:
+        await event.answer("expired"); return
+    _ui.pop(uid, None)
+    label = next((p[3] for p in API_POOL if p[0] == api_id), str(api_id))
+    _active_connect[phone] = uid
+
+    await event.edit(
+        f"**LINKING**\n"
+        f"via **{label}** ({api_id})\n\n"
+        "⏳ telegram is sending the code now...\n\n"
+        "**where the code arrives:**\n"
+        "• the **Telegram app** — chat named **Telegram** (blue checkmark)\n"
+        "• or by **SMS**\n\n"
+        "**reply here with the code.**\n"
+        "if not received, reply `resend`."
+    )
+
+    result = await connect_one(phone, preferred_api=api_id, owner_id=uid)
+    _active_connect.pop(phone, None)
+
+    if result["ok"]:
+        await event.respond(f"✅ linked via {label}", buttons=[
+            [Button.inline("🔗  LINK ANOTHER", data=b"menu:connect")],
+            [Button.inline("◀  MENU", data=b"menu:main")],
+        ])
+    else:
+        await event.respond(f"❌ failed: {result['message']}", buttons=[
+            [Button.inline("🔗  TRY AGAIN", data=b"menu:connect")],
+            [Button.inline("◀  MENU", data=b"menu:main")],
+        ])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^reason:"))
+async def cb_reason(event):
+    uid = event.sender_id
+    allowed = is_super(uid) or is_admin(uid)
+    if not allowed:
+        if is_user_granted_premium(uid):
+            allowed = is_user_premium(uid)
+        else:
+            allowed = False
+    if not allowed:
+        if is_user_granted_premium(uid) and not is_user_premium(uid):
+            await event.answer("⏰ premium expired", alert=True)
+        else:
+            await event.answer("no premium", alert=True)
+        return
+    key = event.data.decode().split(":", 1)[1]
+    target = (_ui.get(uid) or {}).get("target")
+    if target is None:
+        await event.answer("expired"); return
+    _ui.pop(uid, None)
+
+    target_display = target if isinstance(target, str) else str(target)
+    label = REPORT_REASONS.get(key, {}).get("label", key)
+    await event.edit(f"firing {target_display}\n**{label}**\nfrom {len(list_sessions())} accounts...")
+
+    async def progress(i, total, sess, ok, viewer):
+        try:
+            display = sess[:-8] if is_super(viewer) else f"acct{i}"
+            await event.edit(
+                f"firing {target_display} · **{label}**\n"
+                f"{i}/{total}\n"
+                f"last: `{display}` {'✅' if ok else '❌'}"
+            )
+        except Exception:
+            pass
+
+    summary = await run_report(target, reason_key=key, progress_cb=progress, viewer_uid=uid)
+    if summary.get("error"):
+        await event.edit(f"[x] {summary['error']}",
+                         buttons=[[Button.inline("◀  BACK", data=b"menu:main")]])
+        return
+    out = (f"**{target_display}** · **{label}**\n\n"
+           f"✅ {summary['ok']} ok · ❌ {summary['fail']} fail")
+    if is_super(uid) and REPLY_PER_ACCOUNT:
+        fails = [r for r in summary["results"] if not r["ok"]]
+        if fails:
+            out += "\n\n**failures:**\n" + "\n".join(
+                f"• `{r['session'][:-8]}`: {r['error'][:100]}" for r in fails[:10]
+            )
+    await event.edit(out, buttons=[[Button.inline("◀  MENU", data=b"menu:main")]])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^acct:"))
+async def cb_acct(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only"); return
+    phone = event.data.decode().split(":", 1)[1]
+    info = load_session_api().get(phone + ".session", {})
+    owner = info.get("owner_id")
+    body = (f"**ACCOUNT** `{phone}`\n"
+            f"api pair: `{info.get('label','?')}`\n"
+            f"region: `{info.get('region','?')}`\n"
+            f"api_id: `{info.get('api_id','?')}`\n"
+            f"owner: `{owner if owner else 'unknown'}`")
+    await event.edit(body, buttons=account_detail_buttons(phone, uid))
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^unlink:"))
+async def cb_unlink(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only", alert=True); return
+    phone = event.data.decode().split(":", 1)[1]
+    ok = remove_account(phone)
+    if ok:
+        await event.edit("🗑 unlinked.", buttons=[
+            [Button.inline("📋  ACCOUNTS", data=b"menu:list")],
+            [Button.inline("◀  MENU", data=b"menu:main")],
+        ])
+    else:
+        await event.edit("not found.", buttons=[[Button.inline("◀  BACK", data=b"menu:list")]])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^adm:"))
+async def cb_adm(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only"); return
+    target_id = event.data.decode().split(":", 1)[1]
+    info = load_admins().get(target_id, {})
+    text = f"**@{info.get('username','?')}**\nid: `{target_id}`\nrole: **admin**"
+    await event.edit(text, buttons=admin_detail_buttons(target_id))
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^revoke:"))
+async def cb_revoke(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only"); return
+    target_id = event.data.decode().split(":", 1)[1]
+    if target_id == str(SUPER_ID):
+        await event.answer("can't revoke owner"); return
+    remove_admin(int(target_id))
+    await event.edit("❌ removed.", buttons=[[Button.inline("◀  ADMINS", data=b"menu:admins")]])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^puser:"))
+async def cb_puser(event):
+    uid = event.sender_id
+    if not (is_super(uid) or is_admin(uid)):
+        await event.answer("no access"); return
+    target_id = event.data.decode().split(":", 1)[1]
+    info = load_users().get(target_id, {})
+    exp = user_premium_expiry_str(int(target_id))
+    text = f"**@{info.get('username','?')}**\nid: `{target_id}`\npremium left: **{exp}**"
+    rows = []
+    if is_super(uid):
+        rows.append([Button.inline("⬇️  REVOKE PREMIUM", data=f"revokeprem:{target_id}".encode())])
+    rows.append([Button.inline("◀  BACK", data=b"menu:premium_list")])
+    await event.edit(text, buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^revokeprem:"))
+async def cb_revokeprem(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only"); return
+    target_id = event.data.decode().split(":", 1)[1]
+    revoke_user_premium(int(target_id))
+    await event.edit("⬇️ premium revoked.", buttons=[
+        [Button.inline("◀  PREMIUM LIST", data=b"menu:premium_list")],
+    ])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^smsg:"))
+async def cb_smsg(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only"); return
+    msg_id = event.data.decode().split(":", 1)[1]
+    inbox = load_support()
+    entry = inbox.get(msg_id)
+    if not entry:
+        await event.answer("gone"); return
+    text = (f"**📩 SUPPORT MESSAGE**\n\n"
+            f"from: @{entry.get('from_username','?')} (id `{entry.get('from_id')}`)\n\n"
+            f"{entry.get('text','')}")
+    await event.edit(text, buttons=[
+        [Button.inline("↩  REPLY", data=f"sreply:{msg_id}".encode())],
+        [Button.inline("◀  BACK", data=b"menu:support_inbox")],
+    ])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^sreply:"))
+async def cb_sreply(event):
+    uid = event.sender_id
+    if not is_super(uid):
+        await event.answer("owner only"); return
+    msg_id = event.data.decode().split(":", 1)[1]
+    inbox = load_support()
+    entry = inbox.get(msg_id)
+    if not entry:
+        await event.answer("gone"); return
+    _ui[uid] = {"stage": "await_support_reply", "reply_to": msg_id}
+    await event.edit(
+        f"**↩ REPLY to @{entry.get('from_username','?')}**\n\n"
+        f"type your reply and send it.",
+        buttons=[[Button.inline("❌  CANCEL", data=b"menu:support_inbox")]],
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^noop$"))
+async def cb_noop(event):
+    await event.answer()
+
+
+@bot.on(events.NewMessage())
+async def text_input(event):
+    uid = event.sender_id
+    if not (is_super(uid) or is_admin(uid) or is_user(uid)):
+        return
+    text = (event.raw_text or "").strip()
+
+    state = _ui.get(uid) or {}
+
+    if state.get("stage") == "await_capture_forward":
+        fwd = None
+        try:
+            if event.message and getattr(event.message, "forward", None):
+                fwd = event.message.forward
+        except Exception:
+            fwd = None
+        captured_id = None
+        captured_name = None
+        if fwd is not None:
+            captured_id = getattr(fwd, "from_id", None)
+            captured_name = getattr(fwd, "from_name", None)
+            if captured_id is not None:
+                captured_id = getattr(captured_id, "user_id", captured_id)
+        if not captured_id and text:
+            kind, value = parse_target(text)
+            if kind == "id":
+                captured_id = int(value)
+                captured_name = f"user{value}"
+            elif kind == "username":
+                try:
+                    ent = await bot.get_entity("@" + value)
+                    captured_id = ent.id
+                    captured_name = "@" + value
+                except Exception as ex:
+                    await event.reply(f"❌ couldn't resolve @{value}: {ex}")
+                    return
+        if captured_id is None:
+            await event.reply(
+                "❌ couldn't get an id.\n"
+                "forward a message from the user, or send `@username`, or send `1234567890`."
+            )
+            return
+        _ui.pop(uid, None)
+        await event.reply(
+            f"✅ **id captured**\n\n"
+            f"user: `{captured_name}`\n"
+            f"numeric id: `{captured_id}`\n\n"
+            f"copy the id to grant premium:\n"
+            f"`{captured_id} 30`",
+            buttons=[[Button.inline("◀  MENU", data=b"menu:main")]],
+        )
+        return
+
+    if not text or text.startswith("/"):
+        return
+
+    for phone, who in list(_active_connect.items()):
+        if who == uid:
+            if deliver_code(phone, text):
+                await event.reply("✅ code received. processing...")
+                return
+
+    stage = state.get("stage")
+
+    if stage == "await_phone":
+        phone = text if text.startswith("+") else "+" + text
+        if not re.match(r"^\+\d{7,15}$", phone):
+            await event.reply("❌ not a valid phone. try again with `+` format.")
+            return
+        append_account(phone)
+        _ui.pop(uid, None)
+        await event.reply("✅ queued.", buttons=[
+            [Button.inline("🔗  LINK IT NOW", data=b"menu:connect")],
+            [Button.inline("◀  MENU", data=b"menu:main")],
+        ])
+        return
+
+    if stage == "await_target":
+        kind, value = parse_target(text)
+        if not kind:
+            await event.reply(
+                "❌ not valid.\n"
+                "send `@username` or numeric id like `1234567890`."
+            )
+            return
+        target = "@" + value if kind == "username" else int(value)
+        _ui[uid] = {"stage": "pick_reason", "target": target}
+        shown = "@" + value if kind == "username" else value
+        await event.reply(f"target: **{shown}**\npick reason:",
+                          buttons=reason_buttons())
+        return
+
+    if stage == "await_add_admin":
+        if not is_super(uid):
+            _ui.pop(uid, None); return
+        kind, value = parse_target(text)
+        if not kind:
+            await event.reply("❌ need `@name` or numeric id.")
+            return
+        if count_admins() >= MAX_ADMINS:
+            await event.reply(f"❌ admin slots full ({MAX_ADMINS}/{MAX_ADMINS}).")
+            _ui.pop(uid, None)
+            return
+        try:
+            if kind == "id":
+                entity = await bot.get_entity(int(value))
+                username = str(value)
+            else:
+                entity = await bot.get_entity("@" + value)
+                username = value
+        except Exception as ex:
+            await event.reply(f"❌ couldn't resolve {value}: {ex}")
+            return
+        add_admin(entity.id, username)
+        _ui.pop(uid, None)
+        await event.reply(f"✅ added admin `{username}` (id={entity.id})", buttons=[
+            [Button.inline("◀  ADMINS", data=b"menu:admins")],
+        ])
+        return
+
+    if stage == "await_grant_premium":
+        if not (is_super(uid) or is_admin(uid)):
+            _ui.pop(uid, None); return
+        m = re.match(r"^\s*@?([\w\d]+)\s+(\d+)\s*$", text)
+        if not m:
+            await event.reply(
+                "❌ format: `@username 30` or `1234567890 30`"
+            )
+            return
+        target_token = m.group(1)
+        try:
+            days = int(m.group(2))
+        except ValueError:
+            await event.reply("❌ days must be a number.")
+            return
+        if days < 1 or days > 3650:
+            await event.reply("❌ days 1-3650.")
+            return
+        try:
+            if target_token.isdigit():
+                entity = await bot.get_entity(int(target_token))
+                display = target_token
+                store_username = target_token
+            else:
+                entity = await bot.get_entity("@" + target_token)
+                display = "@" + target_token
+                store_username = target_token
+        except Exception as ex:
+            await event.reply(f"❌ couldn't resolve {target_token}: {ex}")
+            return
+        grant_user_premium(entity.id, store_username, days)
+        _ui.pop(uid, None)
+        await event.reply(
+            f"✅ granted premium to **{display}** for **{days} days**\nid: `{entity.id}`",
+            buttons=[[Button.inline("◀  PREMIUM LIST", data=b"menu:premium_list")]],
+        )
+        try:
+            await bot.send_message(
+                entity.id,
+                f"💎 **premium granted**\n\n"
+                f"you have been given **{days} days** of premium.\n\n"
+                f"/start to begin.",
+            )
+        except Exception:
+            pass
+        return
+
+    if stage == "await_support_msg":
+        _ui.pop(uid, None)
+        try:
+            sender = await event.get_sender()
+        except Exception:
+            sender = None
+        from_username = getattr(sender, "username", None) or "unknown"
+        from_id = event.sender_id
+        msg_id = f"{from_id}_{int(datetime.now(timezone.utc).timestamp())}"
+        inbox = load_support()
+        inbox[msg_id] = {
+            "from_id": from_id,
+            "from_username": from_username,
+            "text": text,
+            "preview": text[:40],
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        save_support(inbox)
+        await event.reply("✅ sent. the owner will see it.", buttons=[
+            [Button.inline("◀  MENU", data=b"menu:main")],
+        ])
+        if SUPER_ID:
+            try:
+                await bot.send_message(
+                    SUPER_ID,
+                    f"📩 **new support msg**\nfrom: @{from_username} (id `{from_id}`)\n\n{text}",
+                    buttons=[[Button.inline("📬  OPEN INBOX", data=b"menu:support_inbox")]],
+                )
+            except Exception:
+                pass
+        return
+
+    if stage == "await_support_reply":
+        reply_to = state.get("reply_to")
+        _ui.pop(uid, None)
+        inbox = load_support()
+        entry = inbox.get(reply_to)
+        if not entry:
+            await event.reply("❌ gone.")
+            return
+        target_id = entry.get("from_id")
+        try:
+            await bot.send_message(target_id, f"📬 **owner reply:**\n\n{text}")
+            await event.reply("✅ reply sent.", buttons=[[Button.inline("📬  INBOX", data=b"menu:support_inbox")]])
+        except Exception as ex:
+            await event.reply(f"❌ could not send: {ex}")
+        return
+
+    kind, value = parse_target(text)
+    if kind:
+        allowed = is_super(uid) or is_admin(uid)
+        if not allowed and is_user_granted_premium(uid):
+            allowed = is_user_premium(uid)
+        if allowed:
+            target = "@" + value if kind == "username" else int(value)
+            _ui[uid] = {"stage": "pick_reason", "target": target}
+            shown = "@" + value if kind == "username" else value
+            await event.reply(f"target: **{shown}**\npick reason:",
+                              buttons=reason_buttons())
+            return
+
+
+async def main():
+    global SUPER_ID
+    await bot.start(bot_token=BOT_TOKEN)
+
+    try:
+        entity = await bot.get_entity("@" + SUPER_ADMIN_USERNAME)
+        SUPER_ID = entity.id
+        print(f"[*] owner: @{SUPER_ADMIN_USERNAME} (id={SUPER_ID})")
+    except Exception as e:
+        print(f"[!] could not resolve @{SUPER_ADMIN_USERNAME}: {e}")
+
+    admins = load_admins()
+    if SUPER_ID and str(SUPER_ID) not in admins:
+        admins[str(SUPER_ID)] = {"username": SUPER_ADMIN_USERNAME, "super": True}
+        save_admins(admins)
+        print(f"[*] owner registered.")
+
+    if SUPER_ID is None:
+        @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+        async def _catch(ev):
+            global SUPER_ID
+            sender = await ev.get_sender()
+            uname = getattr(sender, "username", None)
+            if uname and uname.lower() == SUPER_ADMIN_USERNAME.lower():
+                SUPER_ID = sender.id
+                admins = load_admins()
+                admins[str(sender.id)] = {"username": uname, "super": True}
+                save_admins(admins)
+                print(f"[*] owner captured: {SUPER_ID}")
+
+    print("[*] bot online.")
+    print(f"[*] linked accounts: {len(list_sessions())}")
+    print(f"[*] api pairs: {len(API_POOL)}")
+    print(f"[*] admins: {count_admins()}/{MAX_ADMINS}")
+    print(f"[*] premium users: {count_user_premiums()}")
+
+    await bot.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[*] shut down.")
