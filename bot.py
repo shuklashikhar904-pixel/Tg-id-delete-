@@ -2,7 +2,7 @@
 #  [K] Dotbhai Ultimate Monster Bot - FINAL (Error-Free)
 # ================================================================
 
-import asyncio, json, os, time, logging, random, string, html
+import asyncio, json, os, time, logging, random, string, html, urllib.parse
 from datetime import datetime
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -263,7 +263,8 @@ async def msg_support(msg: Message, state: FSMContext):
     await state.clear()
     try:
         safe_text = html.escape(msg.text)
-        await bot.send_message(OWNER_ID, f"🎫 Support from {msg.from_user.id} (@{msg.from_user.username}):\n\n{safe_text}\n\nReply using:\n<code>/reply {msg.from_user.id} your message</code>", parse_mode="HTML")
+        uname = f"@{msg.from_user.username}" if msg.from_user.username else "No Username"
+        await bot.send_message(OWNER_ID, f"🎫 Support from {msg.from_user.id} ({uname}):\n\n{safe_text}\n\nReply using:\n<code>/reply {msg.from_user.id} your message</code>", parse_mode="HTML")
         await msg.answer("✅ Message sent to Owner.", reply_markup=back_kb())
     except: await msg.answer("❌ Failed to send.", reply_markup=back_kb())
 
@@ -390,7 +391,8 @@ async def msg_rep_wa(msg: Message, state: FSMContext):
     if not msg.text: return await msg.answer("❌ Send text only.")
     await state.clear()
     d = load()
-    links = [f"https://wa.me/{n}?text=Reporting%20target:%20{msg.text}" for n in d["wa_reports"]]
+    safe_target = urllib.parse.quote(msg.text)
+    links = [f"https://wa.me/{n}?text=Reporting%20target:%20{safe_target}" for n in d["wa_reports"]]
     out = "💬 <b>WA Reports (Tap to send):</b>\n\n" + "\n".join(f'<a href="{l}">Report to {i+1}</a>' for i, l in enumerate(links[:10]))
     await msg.answer(out, parse_mode="HTML", disable_web_page_preview=True, reply_markup=back_kb())
 
